@@ -185,3 +185,6 @@ output/
 *.safetensors
 *.pt
 *.pth
+outputs/
+helpfulness/
+activations/

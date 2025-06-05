@@ -1,0 +1,36 @@
+method: "sft"
+
+defaults:
+  - model: llama_3_1b_instruct
+  - sft_experiment: lora_r_16_mlp_attn_llama
+  - sft_dataset: alpaca-train
+  - dpo_dataset: hh-rlhf
+  - quantization: 8bit
+
+sft:
+  enabled: True
+  packing: False
+  completion_only_loss: True
+  max_seq_length: 1024
+  num_epochs: 15
+  batch_size_train: 4
+  gradient_accumulation_steps: 2
+  gradient_checkpointing: True
+  optim: "adamw_torch"
+  lr: 1e-4
+  warmup_ratio: 0.03
+  bf16: False
+  fp16: False
+  max_grad_norm: 0.3
+  save_strategy: "steps"
+  save_steps: 50
+  save_total_limit: 3
+  eval_steps: 100
+  eval_strategy: "steps"
+  max_steps: 1000
+  batch_size_eval: 12
+  weight_decay: 0.001
+  push_to_hub: False
+  do_eval: True
+dpo:
+  enabled: False
