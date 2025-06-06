@@ -4,8 +4,8 @@ defaults:
   - model: llama_3_1b_instruct
   - experiment/lora_r_16_mlp_attn_llama@sft_experiment
   - experiment/lora_r_16_mlp_attn_llama@dpo_experiment
-  - sft_dataset: alpaca-train
-  - dpo_dataset: hh-rlhf
+  - dataset/alpaca-train@sft_dataset
+  - dataset/hh-rlhf@dpo_dataset
   - quantization: 8bit
 
 sft:
