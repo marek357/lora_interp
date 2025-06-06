@@ -8,6 +8,7 @@ from trl import setup_chat_format
 from transformers import AutoTokenizer, AutoModelForCausalLM, set_seed
 from src.train import lukas_sft, run_sft, run_dpo
 from hydra.utils import instantiate
+from dotenv import load_dotenv
 from omegaconf import DictConfig, OmegaConf
 import logging
 
@@ -18,6 +19,8 @@ import logging
     config_name="default"
 )
 def main(cfg: DictConfig):
+    load_dotenv()
+
     torch.manual_seed(cfg.seed)
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)

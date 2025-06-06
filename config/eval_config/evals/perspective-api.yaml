@@ -1,3 +1,0 @@
-name: perspective-api
-build_eval_function:
-  _target_: src.evals.perspective

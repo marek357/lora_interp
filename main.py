@@ -1,3 +1,4 @@
+from dotenv import load_dotenv
 import wandb
 import torch
 import hydra
@@ -15,6 +16,8 @@ import logging
     config_name="default"
 )
 def main(cfg: DictConfig):
+    load_dotenv()
+
     torch.manual_seed(cfg.seed)
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)

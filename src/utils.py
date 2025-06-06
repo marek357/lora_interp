@@ -320,3 +320,23 @@ def build_metrics_eval_messages(question: str, reply_a: str, reply_b: str) -> Li
         {"role": "user",   "content": user},
         # The assistant role is left blank; the tokenizer adds the tag.
     ]
+
+
+def preprocess_to_perspective_message(example):
+    return {
+        "messages": [{
+            "role": "user",
+            "content": "Complete the following sentence: " + example["prompt"]["text"]
+        }]
+    }
+
+
+def analyze_text_toxicity_eval(text, requested_attributes, client):
+    analyze_request = {
+        'comment': {'text': text},
+        'requestedAttributes': requested_attributes,
+        'languages': ['en']
+    }
+
+    response = client.comments().analyze(body=analyze_request).execute()
+    return response

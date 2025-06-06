@@ -1,0 +1,3 @@
+name: toxicity
+build_eval_function:
+  _target_: src.evals.toxicity

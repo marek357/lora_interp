@@ -1,3 +1,5 @@
+import json
+from googleapiclient import discovery
 from collections import defaultdict
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import (
@@ -8,8 +10,8 @@ from datasets import (
 from tqdm import tqdm
 import evaluate
 import torch
-
-from src.utils import build_metrics_eval_messages
+import os
+from src.utils import build_metrics_eval_messages, preprocess_to_perspective_message
 
 
 device = 'cuda' if torch.cuda.is_available() else \
@@ -106,7 +108,113 @@ def auto_interp():
     return eval_auto_interp
 
 
-def perspective():
-    def eval_perspective(cfg):
-        print('evaluating perspective')
-    return eval_perspective
+def toxicity():
+    def eval_toxicity(cfg):
+        client = discovery.build(
+            "commentanalyzer",
+            "v1alpha1",
+            developerKey=os.getenv('GOOGLE_API_KEY'),
+            discoveryServiceUrl="https://commentanalyzer.googleapis.com/$discovery/rest?version=v1alpha1",
+            static_discovery=False,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            cfg.evals.toxicity.model_path
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            cfg.evals.toxicity.model_path
+        ).to(device)
+        dataset = load_dataset(
+            cfg.evals.toxicity.dataset_name, split="train"
+        )
+
+        if 'gemma' in model.config._name_or_path:
+            model.generation_config.eos_token_id = [1, 107]
+            model.generation_config.max_length = 512
+
+        challenging_dataset = dataset.filter(
+            lambda example: example["challenging"]
+        )
+
+        prompt_only = challenging_dataset.map(
+            preprocess_to_perspective_message,
+            batched=False,
+            remove_columns=dataset.column_names
+        )
+
+        model.eval()
+
+        full_outputs = []
+        completions_only = []
+
+        pad_id = tokenizer.pad_token_id
+        batch_size = cfg.evals.toxicity.batch_size
+
+        for start in tqdm(
+            range(0, len(prompt_only), batch_size),
+            desc="Generating"
+        ):
+            # ── Slice a (shallow‑copied) mini‑dataset and pull the column as a python list
+            batch_messages = prompt_only[start: start + batch_size]["messages"]
+
+            # ── Convert each conversation into a single prompt string
+            batch_prompts = [
+                tokenizer.apply_chat_template(
+                    msgs, add_generation_prompt=True, tokenize=False)
+                for msgs in batch_messages
+            ]
+
+            # ── Tokenise & push to GPU
+            enc = tokenizer(
+                batch_prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+            ).to("cuda")
+
+            # ── Autoregressive generation
+            gen_ids = model.generate(**enc)
+
+            # ── Decode full strings
+            full_outputs.extend(
+                tokenizer.batch_decode(
+                    gen_ids, skip_special_tokens=True
+                )
+            )
+
+            # ── Extract only the newly generated continuation
+            for prompt_ids, output_ids in zip(enc["input_ids"], gen_ids):
+                # Locate the first END‑OF‑TURN token in the *generated* sequence
+                eot_positions = (
+                    output_ids == cfg.evals.toxicity.end_of_turn_id
+                ).nonzero(as_tuple=True)[0]
+                if len(eot_positions) > 0:
+                    first_eot = eot_positions[0].item()
+                    # after the EOT
+                    completion_ids = output_ids[first_eot + 1:]
+                else:
+                    # Fallback: trim the prompt length, same as before
+                    prompt_ids_no_pad = prompt_ids[prompt_ids != pad_id]
+                    completion_ids = output_ids[len(prompt_ids_no_pad):]
+
+                completions_only.append(
+                    # TODO: decode or batch decode?
+                    tokenizer.decode(
+                        completion_ids, skip_special_tokens=True
+                    ).strip()
+                )
+
+            # optional: free VRAM early
+            del enc, gen_ids
+
+        model.detach().cpu()
+
+        if device == 'cuda':
+            torch.cuda.empty_cache()
+
+        if cfg.evals.toxicity.dump_generated:
+            with open(cfg.evals.toxicity.dump_path, 'w+') as f:
+                json.dump(
+                    [full_outputs, completions_only], f
+                )
+
+    return eval_toxicity
