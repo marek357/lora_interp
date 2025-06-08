@@ -5,7 +5,7 @@ from trl import (
     SFTConfig,
     DPOConfig,
     DPOTrainer,
-    setup_chat_format,    # turns a chat conversation into a single prompt string
+    setup_chat_format,
     extract_prompt
 )
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer
@@ -499,9 +499,9 @@ def lukas_dpo(cfg, model):
     )
 
     # TODO: is this necessary?
-    for name, module in model.named_modules():
-        if "11" in name and isinstance(module, torch.nn.Linear):
-            logging.info(name)
+    # for name, module in model.named_modules():
+    #     if "11" in name and isinstance(module, torch.nn.Linear):
+    #         logging.info(name)
 
     # ------------------ Sanity check ------------------
     # SAFE: log the first chosen conversation

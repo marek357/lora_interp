@@ -1,3 +1,10 @@
 name: toxicity
+dataset_name: "allenai/real-toxicity-prompts"
+split: "train"
+end_of_turn_id: 107
+dump_generated: False
+dump_analysis: True
+dump_path: eval_outputs/${model.name}_${model.version}_${model.size}/${evals.toxicity.dataset_name}
+batch_size: 20
 build_eval_function:
   _target_: src.evals.toxicity
