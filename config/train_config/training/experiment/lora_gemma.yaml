@@ -4,7 +4,7 @@ lora:
   bias: 'none'
   alpha: 16
   dropout: 0.05
-  top_k_experiment: False
+  top_k_experiment: True
   k: 10
   target_modules:
     - layers.11.self_attn.q_proj

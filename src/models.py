@@ -1,34 +1,48 @@
+from peft.tuners.lora import LoraLayer
+import torch.nn.functional as F
+import torch.nn as nn
 import torch
 
 
 # ────────────────────────────────────────────────────────────────────────────
 # Top-k LoRA module  ── self-contained for convenience
 # ────────────────────────────────────────────────────────────────────────────
+def _first_weight(md: nn.ModuleDict):
+    return next(iter(md.values())).weight
 
 
-class TopKLoRALinear(torch.nn.Module):
-    """
-    Wraps a frozen Linear layer with trainable LoRA A/B matrices and Top-k
-    magnitude sparsification on z = A·x.
-    """
-
-    def __init__(self, base: torch.nn.Linear, r=8, alpha=16, k=4):
+class TopKLoRALinear(nn.Module):
+    def __init__(
+            self,
+            base: LoraLayer, *,
+            layer_name: str, r,
+            alpha, k: int
+    ):
         super().__init__()
-        self.weight, self.bias = base.weight, base.bias
-        self.weight.requires_grad = False
-        if self.bias is not None:
-            self.bias.requires_grad = False
+        # store for unwrapping
+        self.lora_module = base
+        # frozen quant/FP layer
+        self.base_layer = base.base_layer
+        # LoRA params
+        self.A = _first_weight(base.lora_A)
+        self.B = _first_weight(base.lora_B)
+        # support dict or int
+        r_val = r["default"] if isinstance(r, dict) else r
+        alpha_val = alpha["default"] if isinstance(alpha, dict) else alpha
+        self.r = int(r_val)
+        self.k = int(k)
+        self.scale = alpha_val / r_val
+        self.layer_name = layer_name
+        print(f"Using a TopK LoRA Adapter with r: {self.r}, k: {self.k}")
 
-        self.r, self.k, self.scale = r, k, alpha / r
-        self.A = torch.nn.Parameter(torch.empty(r, base.in_features))
-        self.B = torch.nn.Parameter(torch.empty(base.out_features, r))
-        torch.nn.init.kaiming_uniform_(self.A, a=torch.sqrt(torch.tensor(5.0)))
-        torch.nn.init.zeros_(self.B)
-
-    def forward(self, x):
-        z = torch.nn.functional.linear(x, self.A)            # (…, r)
+    def forward(self, x: torch.Tensor):
+        # match dtype for mixed precision
+        A = self.A.to(x.dtype)
+        B = self.B.to(x.dtype)
+        z = F.linear(x, A)
         if self.k < self.r:
-            thr = torch.topk(z.abs(), self.k, dim=-1)[0][..., -1:]
-            z = torch.where(z.abs() >= thr, z, torch.zeros_like(z))
-        return (torch.nn.functional.linear(x, self.weight, self.bias)
-                + torch.nn.functional.linear(z, self.B) * self.scale)
+            thresh = z.abs().topk(self.k, dim=-1)[0][..., -1:]
+            z = torch.where(z.abs() >= thresh, z, z.new_zeros(()))
+        out = self.base_layer(x)
+        out += F.linear(z, B) * self.scale
+        return out

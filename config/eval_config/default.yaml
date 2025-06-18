@@ -4,7 +4,7 @@ defaults:
   # - evals/metrics@evals.metrics
   - evals/auto-interpret@evals.auto_interp
   # - evals/toxicity@evals.toxicity
-  - model: sft_gemma_2b
+  - model: dpo_gemma_2b
   # - override hydra/launcher: submitit_slurm
 seed: 42
 checkpoint_dir: adapter

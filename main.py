@@ -54,8 +54,11 @@ def main(cfg: DictConfig):
             print('Loading and merging LoRA adapter from checkpoint')
             model = merge_lora_adapter(
                 cfg.training.model.model_name,
-                cfg.training.adapter.checkpoint_dir
+                cfg.training.adapter.checkpoint_dir,
+                f'experiments/merged/{cfg.training.model.model_name}_sft',
+                save_merged_model=True
             )
+
         model = lukas_dpo(cfg, model)
 
     if cfg.training.dump_trained_model:

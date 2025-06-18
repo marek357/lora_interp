@@ -1,4 +1,5 @@
 import json
+import random
 import re
 from typing import Dict, Any, List, Mapping, Optional, Tuple
 from tqdm import tqdm
@@ -117,6 +118,11 @@ def merge_lora_adapter(
         tokenizer.save_pretrained(merged_output_dir)
 
         print(f"Merged model saved to: {merged_output_dir}")
+
+        # saving and loading the same model removes peft-related attributes
+        merged_model = AutoModelForCausalLM.from_pretrained(
+            merged_output_dir
+        )
 
     return merged_model
 
@@ -521,9 +527,9 @@ def autointerp_token_windows_dict(
     * Newlines inside the context are replaced with the glyph '⏎'
       so the string stays single-line (handy for printing or logging).
     """
-    from pprint import pprint
-    pprint(topk_map)
-    assert False
+    # from pprint import pprint
+    # pprint(topk_map)
+    # assert False
     result: Dict[int, Dict[str, Any]] = {}
     for rank, (ex_idx, tok_pos, val) in sorted(topk_map.items()):
         # stop if we've reached the desired topk
@@ -715,7 +721,7 @@ def autointerp_build_lora_json_with_responses(
     include_few_shot: bool = False,
     temperature: float = 0.0,
     max_tokens: int | None = 512,
-    outfile: str = "lora_neuron_info.json",
+    outfile: str = "temp/lora_neuron_info.json",
     client: OpenAI | None = None,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
     """
@@ -794,6 +800,207 @@ def autointerp_build_lora_json_with_responses(
         f"({len(results)} adapters × {len(next(iter(results.values())))} neurons)"
     )
     return results
+
+
+TOKENIZER_CACHE: Dict[str, Any] = {}
+
+
+def autointerp_tok(model):
+    if model not in TOKENIZER_CACHE:
+        TOKENIZER_CACHE[model] = AutoTokenizer.from_pretrained(
+            model, trust_remote_code=True)
+    return TOKENIZER_CACHE[model]
+
+
+def autointerp_token_window(dataset, tokenizer, ex_idx: int, pos: int, window: int = 7):
+    """Return ±`window` tokens around *pos* with center wrapped in <<…>>."""
+    ids = tokenizer.apply_chat_template(
+        dataset[ex_idx]["input"],
+        add_generation_prompt=False,
+        padding=False,
+        return_tensors="pt"
+    )[0]
+    # s, e = max(0, pos-window), min(ids.size(0), pos+window+1)
+    # toks = [
+    #     tokenizer.decode([tid], skip_special_tokens=False)
+    #     for tid in ids[s:e]
+    # ]
+    # print(len(toks), pos-s, pos, s)
+    # center_idx = pos - s
+    # # if 0 <= center_idx < len(toks):
+    # #     toks[center_idx] = f"<<{toks[center_idx]}>>"
+
+    # toks[pos-s] = f"<<{toks[pos-s]}>>"
+    # return "".join(toks).replace("\n", "⏎")
+    seq_len = ids.size(0)
+
+    if pos < 0 or pos >= seq_len:
+        # Token position is invalid — skip the example
+        return None
+
+    s = max(0, pos - window)
+    e = min(seq_len, pos + window + 1)
+    toks = [tokenizer.decode([tid], skip_special_tokens=False)
+            for tid in ids[s:e]]
+
+    center_idx = pos - s
+    if 0 <= center_idx < len(toks):
+        toks[center_idx] = f"<<{toks[center_idx]}>>"
+        return "".join(toks).replace("\n", "⏎")
+    else:
+        # Token not in window (some rare edge case) — skip
+        return None
+
+
+def autointerp_ctx_lorainfo(layer, nid, rank, lora_info, model, tok_id: Optional[int]):
+    tops = lora_info.get(layer, {}).get(nid, {}).get("top_activations", [])
+    if 0 < rank <= len(tops):
+        return tops[rank-1].replace("<<", "").replace(">>", "").strip()
+    if tok_id is not None:
+        return autointerp_tok(model).decode([tok_id]).strip()
+    return "[UNK]"
+
+
+def autointerp_clean(s):
+    return re.sub(r"\s+", " ", re.sub(r"<<\s*|\s*>>", "", s)).strip()
+
+
+def autointerp_build_dataset(act_dict, lora_info, examples, model, window=7, k_skip=40,
+                             n_examples=10, n_neg=4, seed=42):
+    random.seed(seed)
+    tok = autointerp_tok(model)
+
+    # Build: (layer,nid) -> rows[(tid?,pos,val,rank,ex_idx)]
+    rows_by_neuron: Dict[Tuple[str, str],
+                         List[Tuple[Optional[int], int, float, int, int]]] = {}
+    for layer, ns in act_dict.items():
+        for nid, acts in ns.items():
+            rows = []
+            for rk_str, trip in acts.items():
+                if len(trip) == 3:
+                    ex_idx, pos, val = trip
+                    tid = None
+                elif len(trip) == 4:
+                    ex_idx, tid, pos, val = trip
+                else:
+                    raise ValueError("Activation entry must have 3 or 4 items")
+                rows.append((tid, pos, val, int(rk_str), ex_idx))
+            rows.sort(key=lambda t: -t[2])
+            rows_by_neuron[(layer, nid)] = rows
+
+    all_keys = list(rows_by_neuron.keys())
+    dataset = []
+
+    def ctx(layer, nid, tid, pos, rank, ex_idx):
+        if ex_idx is not None and ex_idx < len(examples):
+            return autointerp_token_window(examples, tok, ex_idx, pos, window)
+        return autointerp_ctx_lorainfo(layer, nid, rank, lora_info, model, tid)
+
+    # for (layer, nid), rows in rows_by_neuron.items():
+    #     if len(rows) <= k_skip:
+    #         continue
+    #     pos_rows = rows[k_skip:]
+    #     positives = random.choices(pos_rows, k=n_examples)
+    #     pos_positions = {p for _tid, p, _v, _r, _e in rows}
+
+    #     for tid, pos, _v, rank, ex_idx in positives:
+    #         negs, tries = [], 0
+    #         while len(negs) < n_neg and tries < 100:
+    #             tries += 1
+    #             nl, nn = random.choice(all_keys)
+    #             if (nl, nn) == (layer, nid):
+    #                 continue
+    #             ntid, npos, _nval, nrank, nex = random.choice(
+    #                 rows_by_neuron[(nl, nn)][:k_skip])
+    #             if npos in pos_positions:
+    #                 continue
+    #             negs.append(ctx(nl, nn, ntid, npos, nrank, nex))
+    #         if len(negs) < n_neg:
+    #             continue
+    #         pos_ctx = ctx(layer, nid, tid, pos, rank, ex_idx)
+    #         sents = negs+[pos_ctx]
+    #         random.shuffle(sents)
+    #         # print(lora_info[layer].keys())
+    #         dataset.append({
+    #             "layer": layer, "neuron": nid,
+    #             "sentences": sents,
+    #             "answer": sents.index(pos_ctx)+1,
+    #             "interpretation": lora_info[layer][str(nid)]["interpretation"],
+    #         })
+    invalid_examples = 0
+    for (layer, nid), rows in rows_by_neuron.items():
+        if len(rows) <= k_skip:
+            continue
+
+        pos_rows = rows[k_skip:]
+        positives = random.choices(pos_rows, k=n_examples)
+        pos_positions = {p for _tid, p, _v, _r, _e in rows}
+
+        for tid, pos, _v, rank, ex_idx in positives:
+            negs, tries = [], 0
+
+            while len(negs) < n_neg and tries < 100:
+                tries += 1
+                nl, nn = random.choice(all_keys)
+                if (nl, nn) == (layer, nid):
+                    continue
+
+                ntid, npos, _nval, nrank, nex = random.choice(
+                    rows_by_neuron[(nl, nn)][:k_skip])
+                if npos in pos_positions:
+                    continue
+
+                # ➕ INSERT THIS SAFETY CHECK:
+                neg_ctx = ctx(nl, nn, ntid, npos, nrank, nex)
+                if neg_ctx is not None:
+                    negs.append(neg_ctx)
+
+            if len(negs) < n_neg:
+                continue  # Skip this positive example — not enough negatives
+
+            # ➕ INSERT THIS SAFETY CHECK:
+            pos_ctx = ctx(layer, nid, tid, pos, rank, ex_idx)
+            if pos_ctx is None:
+                invalid_examples += 1
+                continue  # Skip if we can't build the positive context
+
+            sents = negs + [pos_ctx]
+            random.shuffle(sents)
+
+            dataset.append({
+                "layer": layer,
+                "neuron": nid,
+                "sentences": sents,
+                "answer": sents.index(pos_ctx) + 1,  # 1-based index
+                "interpretation": lora_info[layer][str(nid)]["interpretation"],
+            })
+
+    print(f'Skipped {invalid_examples} invalid examples')
+    return dataset
+
+
+def autointerp_build_prompt(item):
+    lines = [
+        "You are given **five** independent sentences. Exactly **one** of them matches the neuron interpretation below.",
+        "Respond **only** with its number (1-5).",
+        "",
+        f"Neuron interpretation: {item['interpretation']}",
+        "",
+    ]
+    for i, s in enumerate(item['sentences'], 1):
+        lines.append(f"{i}. {autointerp_clean(s)}")
+    return "\n".join(lines)
+
+
+def autointerp_evaluate(preds, ds):
+    acc = sum(p == ex['answer'] for p, ex in zip(preds, ds))/len(ds)
+    return {k: acc for k in ("accuracy", "precision", "recall")}
+
+
+def autointerp_extract_digit(text: str) -> int:
+    """Return first digit 1‑5 found in *text* (or 0 if none)."""
+    m = re.compile(r"[1-5]").search(text)
+    return int(m.group()) if m else 0
 
 
 """

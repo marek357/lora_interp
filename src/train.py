@@ -15,7 +15,7 @@ import peft
 import time
 import os
 from src.models import TopKLoRALinear
-from src.utils import build_quant_config, get_conversational_dataset, is_valid_dpo_pair, preprocess_to_messages, violates_alternation
+from src.utils import build_quant_config, get_conversational_dataset, is_valid_dpo_pair, merge_lora_adapter, preprocess_to_messages, violates_alternation
 from peft import PeftModelForCausalLM
 import numpy as np
 import logging
@@ -321,7 +321,7 @@ def lukas_sft(cfg):
     return trainer.model
 
 
-def lukas_dpo(cfg, model):
+def lukas_dpo_old(cfg, model):
     quant_cfg = build_quant_config(
         cfg.training.quantization
     )
@@ -376,10 +376,12 @@ def lukas_dpo(cfg, model):
         print("Tokenizer already has a chat-template.")
 
     # ------------------ Dataset ------------------
+    print('Loading DPO dataset')
     raw_dataset = load_dataset(
         cfg.training.dpo_dataset.huggingface_dataset_id,
-        split=cfg.training.dpo_dataset.split
+        split=f'{cfg.training.dpo_dataset.split}[:10%]'
     )
+    print('Dataset loaded')
     # 1) HH string  →  chosen/rejected lists
     msg_dataset = raw_dataset.map(
         preprocess_to_messages,
@@ -466,7 +468,7 @@ def lukas_dpo(cfg, model):
         beta=cfg.training.dpo.beta,
         loss_type=cfg.training.dpo.loss_type,
         num_train_epochs=cfg.training.dpo.num_train_epochs,
-        max_steps=cfg.training.max_steps,
+        max_steps=cfg.training.dpo.max_steps,
         per_device_train_batch_size=cfg.training.dpo.per_device_train_batch_size,
         per_device_eval_batch_size=cfg.training.dpo.per_device_eval_batch_size,
         gradient_accumulation_steps=cfg.training.dpo.gradient_accumulation_steps,
@@ -537,15 +539,240 @@ def lukas_dpo(cfg, model):
     logging.info("Training finished in %.1f min", (time.time() - start) / 60)
 
     # ------------------ Saving ------------------
-    out_path = os.path.join(f'experiments/{model_str}_sft', "final_adapter")
+    out_path = os.path.join(f'experiments/{model_str}_dpo', "final_adapter")
     trainer.model.to('cpu')
     trainer.save_model(out_path)
     trainer.model.save_pretrained(
-        f'adapters/sft/{cfg.training.sft_experiment.lora.r}-{cfg.training.sft_experiment.lora.alpha}-'
-        f'{cfg.training.sft_experiment.lora.dropout}/{cfg.training.sft_dataset.name}/'
-        f'{"-".join(cfg.training.sft_experiment.lora.target_modules)}'
+        f'adapters/dpo/{cfg.training.dpo_experiment.lora.r}-{cfg.training.dpo_experiment.lora.alpha}-'
+        f'{cfg.training.dpo_experiment.lora.dropout}/{cfg.training.dpo_dataset.name}/'
+        f'{"-".join(cfg.training.dpo_experiment.lora.target_modules)}'
     )
     logging.info("Adapter saved to %s", out_path)
     wandb.finish()
 
     return trainer.model
+
+
+def lukas_dpo(cfg, model):
+    quant_cfg = build_quant_config(
+        cfg.training.quantization
+    )
+    logging.info("Using quantisation: %s", quant_cfg)
+
+    # if SFT ran before, model is not None
+    if model is None:
+        # otherwise, if just running DPO
+        # initialise model from scratch
+        model = AutoModelForCausalLM.from_pretrained(
+            cfg.training.model.model_name,
+            # quantization doesn't work on Apple Metal
+            quantization_config=quant_cfg if device != 'mps' else None,
+        ).to(device)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        cfg.training.model.model_name, fast=False
+    )
+
+    if 'gemma' in cfg.training.model.name:
+        tokenizer.padding_side = "left"
+        tokenizer.truncation_side = "left"
+    elif 'llama' in cfg.training.model.name:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # copy chat template & special tokens if missing
+    if not getattr(tokenizer, "chat_template", None):
+        try:
+            toks_it = AutoTokenizer.from_pretrained(
+                cfg.training.model.model_it_name,
+                use_fast=False
+            )
+            if getattr(toks_it, "chat_template", None):
+                tokenizer.chat_template = toks_it.chat_template
+                logging.info("chat_template copied from -it model")
+            extra = toks_it.special_tokens_map.get(
+                "additional_special_tokens", []
+            )
+            new_tokens = [
+                t for t in extra
+                if t not in tokenizer.get_vocab()
+            ]
+            if new_tokens:
+                tokenizer.add_special_tokens(
+                    {"additional_special_tokens": new_tokens}
+                )
+                model.resize_token_embeddings(len(tokenizer))
+                logging.info("Added %d extra special tokens", len(new_tokens))
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Failed to copy -it tokenizer: %s", exc)
+    else:
+        print("Tokenizer already has a chat-template.")
+
+    print('Loading DPO dataset')
+    raw_dataset = load_dataset(
+        cfg.training.dpo_dataset.huggingface_dataset_id,
+        split=f'{cfg.training.dpo_dataset.split}[:10%]'
+    )
+    print('Dataset loaded')
+    # 1) HH string  →  chosen/rejected lists
+    msg_dataset = raw_dataset.map(
+        preprocess_to_messages,
+        remove_columns=raw_dataset.column_names
+    )
+
+    # 2) drop role‑alternation violations (code from previous answer)
+    msg_dataset = msg_dataset.filter(
+        lambda ex: not violates_alternation(ex["chosen"])
+        and not violates_alternation(ex["rejected"])
+    )
+
+    # 3) ensure at least two turns and assistant‑ending
+    msg_dataset = msg_dataset.filter(
+        lambda ex: is_valid_dpo_pair(ex["chosen"])
+        and is_valid_dpo_pair(ex["rejected"])
+    )
+
+    logging.info("Dataset after all filters: %d rows", len(msg_dataset))
+
+    # adds 'prompt' field expected by DPO
+    msg_dataset = msg_dataset.map(extract_prompt)
+    # TODO: again, why are we manually splitting if we can use the default split from huggingface?
+    msg_dataset = msg_dataset.train_test_split(
+        test_size=0.1, seed=cfg.seed
+    )
+    train_ds, eval_ds = msg_dataset["train"], msg_dataset["test"]
+    logging.info(
+        "Dataset after filters: %d rows",
+        len(train_ds) + len(eval_ds)
+    )
+    logging.info(train_ds)
+
+    eot_token = (
+        tokenizer.special_tokens_map.get(
+            "additional_special_tokens",
+            [tokenizer.eos_token]
+        )[1]
+        if len(tokenizer.special_tokens_map.get("additional_special_tokens", [])) > 1
+        else tokenizer.eos_token
+    )
+    model.generation_config.eos_token_id = [
+        model.generation_config.eos_token_id,
+        tokenizer.convert_tokens_to_ids(eot_token),
+    ]
+    logging.info("EOT token set to %s", eot_token)
+
+    os.makedirs(cfg.get("output_dir", "outputs"), exist_ok=True)
+
+    # Model & tokenizer
+    ref_model = merge_lora_adapter(
+        cfg.training.model.model_name,
+        cfg.training.adapter.checkpoint_dir,
+        f'experiments/merged/{cfg.training.model.model_name}_sft',
+        save_merged_model=True
+    )
+
+    # ref_model = AutoModelForCausalLM.from_pretrained(
+    #     cfg["model_name"], quantization_config=quant_cfg, device_map="auto"
+    # )
+
+    # LoRA config + record k
+    lcfg = cfg.training.dpo_experiment.lora
+    if lcfg.top_k_experiment:
+        topk_k = lcfg.k
+    else:
+        topk_k = lcfg.r
+
+    peft_cfg = LoraConfig(
+        r=lcfg.r,
+        lora_alpha=lcfg.alpha,
+        lora_dropout=lcfg.dropout,
+        bias=lcfg.bias,
+        task_type=TaskType.CAUSAL_LM,
+        target_modules=lcfg.target_modules,
+    )
+    peft_cfg.k = topk_k  # record Top-k in adapter_config.json
+
+    # Apply LoRA
+    model = get_peft_model(model, peft_cfg)
+    print(model)
+
+    # Inject Top-k wrappers
+    replaced = 0
+    for name, module in model.named_modules():
+        if getattr(module, "lora_A", None) is None:
+            continue
+        parent = model.get_submodule(".".join(name.split(".")[:-1]))
+        attr = name.split(".")[-1]
+        setattr(parent, attr, TopKLoRALinear(
+            module,
+            layer_name=name,
+            r=module.r,
+            alpha=module.lora_alpha,
+            k=topk_k,
+        ))
+        replaced += 1
+    logging.info("TopKLoRALinear injected in %d layers", replaced)
+
+    # DPO training args
+    dargs = cfg.training.dpo
+    model_str = f'{cfg.training.model.name}_{cfg.training.model.version}_{cfg.training.model.size}'
+    dpo_cfg = DPOConfig(
+        max_prompt_length=dargs.max_prompt_length,
+        max_completion_length=dargs.max_completion_length,
+        max_steps=dargs.max_steps,
+        beta=dargs.beta,
+        loss_type=dargs.loss_type,
+        num_train_epochs=dargs.num_train_epochs,
+        per_device_train_batch_size=dargs.per_device_train_batch_size,
+        per_device_eval_batch_size=dargs.per_device_eval_batch_size,
+        gradient_accumulation_steps=dargs.gradient_accumulation_steps,
+        gradient_checkpointing=dargs.gradient_checkpointing,
+        optim=dargs.optim,
+        learning_rate=dargs.learning_rate,
+        warmup_ratio=dargs.warmup_ratio,
+        lr_scheduler_type=cfg.lr_scheduler.type,
+        bf16=dargs.bf16,
+        fp16=dargs.fp16,
+        max_grad_norm=dargs.max_grad_norm,
+        logging_steps=cfg.logger.logging_steps,
+        save_strategy=dargs.save_strategy,
+        save_steps=dargs.save_steps,
+        save_total_limit=dargs.save_total_limit,
+        # eval_strategy=dargs.eval_strategy,
+        # eval_steps=dargs.eval_steps,
+        report_to=cfg.logger.report_to,
+        output_dir=f'experiments/{model_str}_dpo',
+        logging_dir=f'experiments/{model_str}_dpo/logs',
+        do_eval=False,
+    )
+
+    # Trainer setup
+    trainer = DPOTrainer(
+        model=model,
+        ref_model=ref_model,
+        args=dpo_cfg,
+        peft_config=None,
+        train_dataset=train_ds,
+        eval_dataset=None,
+        processing_class=tokenizer,
+    )
+
+    # Train
+    t0 = time.time()
+    trainer.train()
+    logging.info("Training finished in %.1f min", (time.time()-t0)/60)
+
+    # ── Unwrap Top-k wrappers before saving ─────────────────────────────
+    unwrapped = 0
+    for name, module in model.named_modules():
+        if isinstance(module, TopKLoRALinear):
+            parent = model.get_submodule(".".join(name.split(".")[:-1]))
+            attr = name.split(".")[-1]
+            setattr(parent, attr, module.lora_module)
+            unwrapped += 1
+    logging.info("Reverted %d TopK wrappers back to LoraLayer", unwrapped)
+
+    # Save adapter
+    out_path = os.path.join(cfg["output_dir"], "final_adapter")
+    trainer.save_model(out_path)
+    logging.info("Adapter saved to %s", out_path)
+    wandb.finish()

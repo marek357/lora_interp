@@ -1,8 +1,10 @@
 import json
 import re
+import time
 from googleapiclient import discovery
 from collections import defaultdict
 import numpy as np
+from openai import OpenAI
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import (
     get_dataset_config_names,
@@ -22,8 +24,12 @@ from src.utils import (
     AutointerpChatCollator,
     analyze_text_toxicity_eval,
     autointerp_build_activation_prompt,
+    autointerp_build_dataset,
     autointerp_build_lora_json_with_responses,
+    autointerp_build_prompt,
     autointerp_collapse_heaps,
+    autointerp_evaluate,
+    autointerp_extract_digit,
     autointerp_is_valid_dpo_pair,
     autointerp_make_topk_hook,
     autointerp_preprocess_to_messages,
@@ -113,10 +119,16 @@ def metrics():
 def auto_interp():
     def eval_auto_interp(cfg):
         print('Evaluating auto interp')
+
         tokenizer = AutoTokenizer.from_pretrained(
             cfg.evals.auto_interp.adapter_checkpoint_dir,
             use_fast=True
         )
+        if 'gemma' in cfg.model.name:
+            tokenizer.padding_side = "left"
+            tokenizer.truncation_side = "left"
+        elif 'llama' in cfg.model.name:
+            tokenizer.pad_token = tokenizer.eos_token
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
@@ -238,22 +250,71 @@ def auto_interp():
         # pprint(adapters_pos_map)
         if cfg.evals.auto_interp.dump_generated:
             with open(
-                "adapters_pos_map_topk.json", "w", encoding="utf-8"
+                "temp/adapters_pos_map_topk.json", "w", encoding="utf-8"
             ) as f:
                 json.dump(
                     adapters_pos_map, f,
                     indent=2, ensure_ascii=False
                 )
 
-        # pprint(adapters_pos_map)
-        # assert False
-        json_blob = autointerp_build_lora_json_with_responses(
-            adapters_pos_map,
-            flat_ds, tokenizer,
-            model="gpt-4o-mini",
-            include_cot=False,
-            include_few_shot=False
+        try:
+            with open('temp/lora_neuron_info.json', 'r') as f:
+                json_blob = json.load(f)
+            print('succesfully loaded neuron interp from cache')
+        except FileNotFoundError:
+            print('neuron interp not found in cache, regenerating...')
+            json_blob = autointerp_build_lora_json_with_responses(
+                adapters_pos_map,
+                flat_ds, tokenizer,
+                model="gpt-4o-mini",
+                include_cot=False,
+                include_few_shot=False
+            )
+
+        activations = adapters_pos_map
+        lora_info = json_blob
+        examples = flat_ds
+        dataset = autointerp_build_dataset(
+            activations,
+            lora_info,
+            examples,
+            cfg.model.adapter_checkpoint_dir,
+            window=cfg.evals.auto_interp.context_size_each_side,
         )
+
+        print(f"Generated {len(dataset)} test items.")
+
+        print(autointerp_build_prompt(dataset[0]))
+
+        client = OpenAI()
+        predictions, correct = [], 0
+        bar = tqdm(dataset, desc="Evaluating", unit="ex")
+        for i, ex in enumerate(bar, 1):
+            user_prompt = autointerp_build_prompt(ex)
+            resp = client.chat.completions.create(
+                model=cfg.evals.auto_interp.chat_model,
+                temperature=cfg.evals.auto_interp.chat_model_temperature,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": cfg.evals.auto_interp.chat_system_prompt
+                    },
+                    {
+                        "role": "user",
+                        "content": user_prompt
+                    },
+                ],
+            )
+            reply = resp.choices[0].message.content.strip()
+            pred = autointerp_extract_digit(reply)
+            predictions.append(pred)
+            if pred == ex["answer"]:
+                correct += 1
+            bar.set_postfix(acc=f"{correct / i:.3f}")
+            time.sleep(cfg.evals.auto_interp.sleep_sec)
+
+        metrics = autointerp_evaluate(predictions, dataset)
+        print("Evaluation metrics:", metrics)
 
     return eval_auto_interp
 
