@@ -228,7 +228,7 @@ def hh_string_to_messages(text: str) -> List[Dict[str, str]]:
     return msgs
 
 
-def preprocess_to_messages(example: Dict[str, Any]) -> Dict[str, Any]:
+def hh_rlhf_preprocess_to_messages(example: Dict[str, Any]) -> Dict[str, Any]:
     """Map HH‑RLHF record → {'chosen': [...], 'rejected': [...]} chat lists."""
     return {
         "chosen":   hh_string_to_messages(example["chosen"]),

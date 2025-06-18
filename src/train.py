@@ -15,7 +15,7 @@ import peft
 import time
 import os
 from src.models import TopKLoRALinear
-from src.utils import build_quant_config, get_conversational_dataset, is_valid_dpo_pair, merge_lora_adapter, preprocess_to_messages, violates_alternation
+from src.utils import build_quant_config, get_conversational_dataset, hh_rlhf_preprocess_to_messages, is_valid_dpo_pair, merge_lora_adapter, preprocess_to_messages, violates_alternation
 from peft import PeftModelForCausalLM
 import numpy as np
 import logging
@@ -615,7 +615,7 @@ def lukas_dpo(cfg, model):
     print('Dataset loaded')
     # 1) HH string  →  chosen/rejected lists
     msg_dataset = raw_dataset.map(
-        preprocess_to_messages,
+        hh_rlhf_preprocess_to_messages,
         remove_columns=raw_dataset.column_names
     )
 
