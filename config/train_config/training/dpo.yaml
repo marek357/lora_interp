@@ -2,11 +2,16 @@ method: "dpo"
 
 defaults:
   - model: gemma_2b
-  - experiment/lora_r_16_mlp_attn_llama@sft_experiment
-  - experiment/lora_r_16_mlp_attn_llama@dpo_experiment
+  - experiment/lora_gemma@sft_experiment
+  - experiment/lora_gemma@dpo_experiment
   - dataset/alpaca-train@sft_dataset
   - dataset/hh-rlhf@dpo_dataset
+  - adapter: gemma_2b
   - quantization: 8bit
+
+
+dump_trained_model: True
+dump_path: "models/dpo/${training.model.model_name}"
 
 
 sft:
@@ -19,7 +24,7 @@ dpo:
   beta: 0.1
   loss_type: 'sigmoid'
   num_train_epochs: 1
-  per_device_train_batch_size: 8
+  per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
   gradient_accumulation_steps: 1
   gradient_checkpointing: True

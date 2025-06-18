@@ -1,4 +1,5 @@
 import json
+import re
 from googleapiclient import discovery
 from collections import defaultdict
 import numpy as np
@@ -8,12 +9,29 @@ from datasets import (
     load_dataset,
     concatenate_datasets
 )
+from peft import PeftModel
+from torch.utils.data import DataLoader
+from itertools import islice
+from peft.tuners.lora import LoraLayer
 from pathlib import Path
 from tqdm import tqdm
 import evaluate
 import torch
 import os
-from src.utils import analyze_text_toxicity_eval, build_metrics_eval_messages, preprocess_to_perspective_message
+from src.utils import (
+    AutointerpChatCollator,
+    analyze_text_toxicity_eval,
+    autointerp_build_activation_prompt,
+    autointerp_build_lora_json_with_responses,
+    autointerp_collapse_heaps,
+    autointerp_is_valid_dpo_pair,
+    autointerp_make_topk_hook,
+    autointerp_preprocess_to_messages,
+    autointerp_token_windows_dict,
+    autointerp_violates_alternation,
+    build_metrics_eval_messages,
+    preprocess_to_perspective_message
+)
 
 
 device = 'cuda' if torch.cuda.is_available() else \
@@ -35,11 +53,14 @@ def metrics():
         model.eval()
         configs = get_dataset_config_names("HuggingFaceH4/hhh_alignment")
         parts = []
-        for cfg in configs:
-            ds = load_dataset("HuggingFaceH4/hhh_alignment", cfg, split="test")
-            ds = ds.add_column("subset", [cfg] * len(ds))
+        for cfg_ in configs:
+            ds = load_dataset(
+                "HuggingFaceH4/hhh_alignment",
+                cfg_, split="test"
+            )
+            ds = ds.add_column("subset", [cfg_] * len(ds))
             parts.append(ds)
-            print(f"Loaded {cfg:8} subset with {len(ds)} rows.")
+            print(f"Loaded {cfg_:8} subset with {len(ds)} rows.")
         hhh_all = concatenate_datasets(parts)
         assert len(hhh_all) == 221
 
@@ -91,22 +112,149 @@ def metrics():
 
 def auto_interp():
     def eval_auto_interp(cfg):
-        # tokenizer = AutoTokenizer.from_pretrained(
-        #     cfg.checkpoint_dir,
-        #     use_fast=True
-        # )
-        # model = AutoModelForCausalLM.from_pretrained(
-        #     cfg.checkpoint_dir,
-        #     torch_dtype="auto"
-        # ).to(device)
-        # model.eval()
+        print('Evaluating auto interp')
+        tokenizer = AutoTokenizer.from_pretrained(
+            cfg.evals.auto_interp.adapter_checkpoint_dir,
+            use_fast=True
+        )
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
 
-        # topk_store = defaultdict(
-        #     lambda: defaultdict(lambda: {"pos": [], "neg": []})
-        # )
-        # example_counter = 0        # global running index over all examples
+        model = AutoModelForCausalLM.from_pretrained(
+            cfg.evals.auto_interp.base_model_name,
+            torch_dtype="auto",
+            device_map="cpu"
+        )
 
-        print('evaluating auto interp')
+        model = PeftModel.from_pretrained(
+            model,
+            cfg.evals.auto_interp.adapter_checkpoint_dir,
+            # there are issues with mps
+            # so first loading to cpu
+            # and then moving it to $device
+            device_map="cpu"
+        )
+        model.to(device)
+        model.eval()
+
+        topk_store = defaultdict(
+            lambda: defaultdict(lambda: {"pos": [], "neg": []})
+        )
+        example_counter = 0        # global running index over all examples
+        lora_modules = {
+            name: mod
+            for name, mod in model.named_modules()
+            if f".{cfg.evals.auto_interp.layer_idx}." in name and
+            isinstance(mod, LoraLayer)
+        }
+
+        # TODO: do NOT rely on global state
+        current_vals = {
+            'current_ex_offset': 0,
+            'current_pad_mask': None  # will be set per batch
+        }
+
+        for name, mod in lora_modules.items():
+            mod.register_forward_hook(
+                autointerp_make_topk_hook(
+                    name, cfg, topk_store, current_vals
+                )
+            )
+        print(f"✔ registered hooks for {len(lora_modules)} LoRA blocks")
+
+        raw_ds = load_dataset(
+            cfg.evals.auto_interp.dataset_name,
+            split="train"
+        )
+
+        _TAG_RE = re.compile(r"(Human|Assistant):")
+        _ROLE_MAP = {"Human": "user", "Assistant": "assistant"}
+
+        msg_ds = raw_ds.map(
+            autointerp_preprocess_to_messages,
+            remove_columns=raw_ds.column_names
+        )
+
+        msg_ds = msg_ds.filter(
+            lambda ex:
+            not autointerp_violates_alternation(ex["chosen"]) and
+            not autointerp_violates_alternation(ex["rejected"]) and
+            autointerp_is_valid_dpo_pair(ex["chosen"]) and
+            autointerp_is_valid_dpo_pair(ex["rejected"])
+        )
+
+        chosen_ds = msg_ds.rename_column(
+            "chosen", "input"
+        ).remove_columns(["rejected"])
+
+        rejected_ds = msg_ds.rename_column(
+            "rejected", "input"
+        ).remove_columns(["chosen"])
+
+        flat_ds = concatenate_datasets(
+            [chosen_ds, rejected_ds]
+        ).shuffle(seed=cfg.seed)
+
+        print(f"Dataset size after flattening: {len(flat_ds):,}")
+
+        # assert False
+
+        autointerp_collate_chat = AutointerpChatCollator(tokenizer, device)
+        loader = DataLoader(
+            flat_ds,
+            batch_size=cfg.evals.auto_interp.batch_size,
+            shuffle=False,
+            collate_fn=autointerp_collate_chat,
+            drop_last=False
+        )
+
+        MAX_BATCHES = int(
+            cfg.evals.auto_interp.max_rows/cfg.evals.auto_interp.batch_size
+        )
+
+        # take only the first MAX_BATCHES batches
+        limited_loader = islice(loader, MAX_BATCHES)
+
+        for row_idx, batch in enumerate(
+            tqdm(limited_loader, total=MAX_BATCHES), start=0
+        ):
+            input_ids = batch["input_ids"].to(device)
+            current_vals['current_pad_mask'] = batch["attention_mask"].to(
+                torch.bool
+            )
+            B = input_ids.size(0)
+
+            _ = model(input_ids)             # hooks fire here
+
+            current_vals['current_pad_mask'] = None         # clear reference
+            current_vals['current_ex_offset'] += B
+
+        # from pprint import pprint
+        # pprint(topk_store)
+
+        # assert False
+        adapters_pos_map = autointerp_collapse_heaps(topk_store)
+
+        # pprint(adapters_pos_map)
+        if cfg.evals.auto_interp.dump_generated:
+            with open(
+                "adapters_pos_map_topk.json", "w", encoding="utf-8"
+            ) as f:
+                json.dump(
+                    adapters_pos_map, f,
+                    indent=2, ensure_ascii=False
+                )
+
+        # pprint(adapters_pos_map)
+        # assert False
+        json_blob = autointerp_build_lora_json_with_responses(
+            adapters_pos_map,
+            flat_ds, tokenizer,
+            model="gpt-4o-mini",
+            include_cot=False,
+            include_few_shot=False
+        )
+
     return eval_auto_interp
 
 

@@ -466,6 +466,7 @@ def lukas_dpo(cfg, model):
         beta=cfg.training.dpo.beta,
         loss_type=cfg.training.dpo.loss_type,
         num_train_epochs=cfg.training.dpo.num_train_epochs,
+        max_steps=cfg.training.max_steps,
         per_device_train_batch_size=cfg.training.dpo.per_device_train_batch_size,
         per_device_eval_batch_size=cfg.training.dpo.per_device_eval_batch_size,
         gradient_accumulation_steps=cfg.training.dpo.gradient_accumulation_steps,
@@ -481,11 +482,12 @@ def lukas_dpo(cfg, model):
         save_strategy=cfg.training.dpo.save_strategy,
         save_steps=cfg.training.dpo.save_steps,
         save_total_limit=cfg.training.dpo.save_total_limit,
-        eval_strategy=cfg.training.dpo.eval_strategy,
-        eval_steps=cfg.training.dpo.eval_steps,
+        # eval_strategy=cfg.training.dpo.eval_strategy,
+        # eval_steps=cfg.training.dpo.eval_steps,
         report_to=cfg.logger.report_to,
         output_dir=f'experiments/{model_str}_dpo',
         logging_dir=f'experiments/{model_str}_dpo/logs',
+        do_eval=False
     )
 
     trainer = DPOTrainer(
@@ -494,7 +496,7 @@ def lukas_dpo(cfg, model):
         args=dpo_cfg,
         peft_config=None,           # already applied
         train_dataset=train_ds,
-        eval_dataset=eval_ds,
+        eval_dataset=None,
         processing_class=tokenizer,
     )
 
@@ -536,6 +538,7 @@ def lukas_dpo(cfg, model):
 
     # ------------------ Saving ------------------
     out_path = os.path.join(f'experiments/{model_str}_sft', "final_adapter")
+    trainer.model.to('cpu')
     trainer.save_model(out_path)
     trainer.model.save_pretrained(
         f'adapters/sft/{cfg.training.sft_experiment.lora.r}-{cfg.training.sft_experiment.lora.alpha}-'

@@ -9,6 +9,8 @@ from src.train import lukas_dpo, lukas_sft, run_sft, run_dpo
 from omegaconf import DictConfig, OmegaConf
 import logging
 
+from src.utils import merge_lora_adapter
+
 
 @hydra.main(
     version_base=None,
@@ -45,7 +47,19 @@ def main(cfg: DictConfig):
         model = lukas_sft(cfg)
 
     if cfg.training.dpo.enabled:
+        if model is not None:
+            print('Merging LoRA adapter from memory after SFT training')
+            model = model.merge_and_unload()
+        else:
+            print('Loading and merging LoRA adapter from checkpoint')
+            model = merge_lora_adapter(
+                cfg.training.model.model_name,
+                cfg.training.adapter.checkpoint_dir
+            )
         model = lukas_dpo(cfg, model)
+
+    if cfg.training.dump_trained_model:
+        model.save_pretrained(cfg.training.dump_path)
 
 
 if __name__ == '__main__':

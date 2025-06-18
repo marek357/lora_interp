@@ -1,19 +1,22 @@
 method: "sft"
 
 defaults:
-  - model: llama_3_1b_instruct
-  - experiment/lora_r_16_mlp_attn_llama@sft_experiment
-  - experiment/lora_r_16_mlp_attn_llama@dpo_experiment
+  - model: gemma_2b
+  - experiment/lora_gemma@sft_experiment
+  - experiment/lora_gemma@dpo_experiment
   - dataset/alpaca-train@sft_dataset
   - dataset/hh-rlhf@dpo_dataset
   - quantization: 8bit
+
+dump_trained_model: True
+dump_path: "models/sft/${training.model.model_name}"
 
 sft:
   enabled: True
   packing: False
   completion_only_loss: True
   max_seq_length: 1024
-  num_epochs: 15
+  num_epochs: 1
   batch_size_train: 4
   gradient_accumulation_steps: 2
   gradient_checkpointing: True
@@ -28,7 +31,7 @@ sft:
   save_total_limit: 3
   eval_steps: 100
   eval_strategy: "steps"
-  max_steps: 1000
+  max_steps: 50
   batch_size_eval: 12
   weight_decay: 0.001
   push_to_hub: False

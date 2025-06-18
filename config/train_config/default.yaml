@@ -1,7 +1,7 @@
 defaults:
   - training: sft
   - lr_scheduler: cosine
-  - logger: wandb
+  - logger: wandb_disabled
   # - override hydra/launcher: submitit_slurm
 seed: 42
 experiment_name: ${training.method}_${training.model}_experiment
