@@ -1,0 +1,30 @@
+# Base TopK LoRA experiment template for r/k sweeps
+# Override lora.r and lora.k via Hydra sweeps or CLI.
+size: "grid"
+
+lora:
+  r: 1024
+  alpha: ${mul:2,${.r}}  # keep alpha scaled to r by default
+  bias: 'none'
+  dropout: 0.02
+
+  # TopK-specific knobs
+  use_topk: true
+  top_k_experiment: true
+  k: 8
+  k_final: ${.k}           # constant-k by default; override to schedule
+  k_schedule: constant
+  temperature: 0.1
+  temperature_final: 0.01
+  temperature_schedule: linear
+
+  # Apply TopK to all standard projection modules
+  layer: full
+  target_modules:
+    - o_proj
+    - v_proj
+    - k_proj
+    - q_proj
+    - gate_proj
+    - up_proj
+    - down_proj

@@ -1,0 +1,13 @@
+defaults:
+  - basic
+
+hydra:
+  sweeper:
+    params:
+      training.dpo_experiment.lora.r: 512,1024,2304,4096,8192,16384,32768
+      training.dpo_experiment.lora.k: 1,2,4,8,16,32,64,128,256,512
+  sweep:
+    dir: outputs/sweeps/${now:%Y-%m-%d}/dpo_rk
+    subdir: ${experiment_name}
+  run:
+    dir: outputs/runs/${now:%Y-%m-%d}/${experiment_name}
